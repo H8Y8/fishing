@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>貓咪釣魚樂</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{
+  width:100%;height:100%;overflow:hidden;
+  background:#050d1a;
+  overscroll-behavior:none;
+  touch-action:none;
+  -webkit-touch-callout:none;
+  -webkit-user-select:none;user-select:none;
+}
+body{
+  display:flex;
+  padding:env(safe-area-inset-top,0) env(safe-area-inset-right,0) env(safe-area-inset-bottom,0) env(safe-area-inset-left,0);
+}
+canvas{width:100%;height:100%;display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ============================================================
+//  《貓咪釣魚樂》— 手機優先・虛擬搖桿版
+//  Mobile-first HTML5 Canvas fishing game
+// ============================================================
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ==================== 顯示與佈局 ====================
+let W, H, DPR;        // 邏輯寬高、裝置像素比
+let SEA_Y;             // 海平面 Y
+let CTRL_H;            // 底部控制區高度
+let GAME_H;            // 遊戲區高度（扣除控制區）
+let S;                 // 全域縮放因子
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  recalcLayout();
+}
+
+function recalcLayout() {
+  // 縮放因子：以 500px 寬為基準
+  S = Math.max(0.75, Math.min(1.8, W / 500));
+  // 控制區高度
+  CTRL_H = Math.max(110, Math.min(160, H * 0.18));
+  GAME_H = H - CTRL_H;
+  // 海平面（遊戲區上方 17%）
+  SEA_Y = GAME_H * 0.17;
+  // 玩家位置
+  player.y = SEA_Y - 16 * S;
+  player.x = Math.max(30 * S, Math.min(W - 30 * S, player.x || W / 2));
+  // 搖桿位置
+  joy.cx = Math.max(70 * S, W * 0.15);
+  joy.cy = H - CTRL_H / 2;
+  joy.r  = Math.min(48 * S, CTRL_H * 0.35);
+  joy.kr = joy.r * 0.42;
+  // 釣魚鈕位置
+  cast.cx = Math.min(W - 70 * S, W * 0.85);
+  cast.cy = H - CTRL_H / 2;
+  cast.r  = Math.min(42 * S, CTRL_H * 0.33);
+}
+
+window.addEventListener('resize', resize);
+
+// ==================== 遊戲常數 ====================
+const PLAYER_SPEED = 3.5;
+const HOOK_GRAVITY = 2.6;
+const HOOK_REEL    = 4.8;
+const HUNGER_MAX   = 100;
+const HUNGER_DECAY = 0.028;
+const STUN_FRAMES  = 90;          // ≈ 1.5 秒
+const SPAWN_MIN    = 40;
+const SPAWN_MAX    = 85;
+
+// ==================== 遊戲狀態 ====================
+let score       = 0;
+let hunger      = HUNGER_MAX;
+let gameOver    = false;
+let stunTimer   = 0;
+let frameCount  = 0;
+let spawnCD     = 50;
+let screenFlash = 0;               // 受擊畫面閃爍
+let castRequested = false;          // 觸控釣魚請求
+
+// ==================== 玩家 ====================
+const player = { x: 0, y: 0, bobY: 0 };
+
+// ==================== 釣鉤 ====================
+const hook = { x: 0, y: 0, active: false, reeling: false, caught: null };
+
+// ==================== 鍵盤輸入 ====================
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true;  if(!gameOver) e.preventDefault(); });
+window.addEventListener('keyup',   e => { keys[e.code] = false; });
+
+// ==================== 虛擬搖桿 ====================
+const joy = {
+  cx: 0, cy: 0, r: 48, kr: 20,   // 位置、基底半徑、把手半徑
+  dx: 0, dy: 0,                    // 把手偏移
+  tid: null, active: false,        // 觸控追蹤
+};
+
+// ==================== 釣魚按鈕 ====================
+const cast = {
+  cx: 0, cy: 0, r: 38,
+  tid: null, pressed: false,
+};
+
+// ==================== 重新開始按鈕（Game Over 用）====================
+const restartBtn = { x: 0, y: 0, w: 0, h: 0 };
+
+// ==================== 觸控處理 ====================
+function touchPos(t) {
+  const r = canvas.getBoundingClientRect();
+  return { x: t.clientX - r.left, y: t.clientY - r.top };
+}
+function dist(x1, y1, x2, y2) { return Math.hypot(x1 - x2, y1 - y2); }
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const p = touchPos(t);
+    // Game Over → 重新開始
+    if (gameOver) {
+      if (p.x >= restartBtn.x && p.x <= restartBtn.x + restartBtn.w &&
+          p.y >= restartBtn.y && p.y <= restartBtn.y + restartBtn.h) {
+        restartGame();
+      }
+      continue;
+    }
+    // 搖桿（擴大觸擊區）
+    if (joy.tid === null && dist(p.x, p.y, joy.cx, joy.cy) < joy.r * 2.2) {
+      joy.tid = t.identifier;
+      joy.active = true;
+      updateJoy(p.x, p.y);
+      continue;
+    }
+    // 釣魚鈕（擴大觸擊區）
+    if (cast.tid === null && dist(p.x, p.y, cast.cx, cast.cy) < cast.r * 2.2) {
+      cast.tid = t.identifier;
+      cast.pressed = true;
+      castRequested = true;
+      continue;
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (t.identifier === joy.tid) updateJoy(touchPos(t).x, touchPos(t).y);
+  }
+}, { passive: false });
+
+function onTouchEnd(e) {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joy.tid)  { joy.tid = null; joy.active = false; joy.dx = joy.dy = 0; }
+    if (t.identifier === cast.tid) { cast.tid = null; cast.pressed = false; }
+  }
+}
+canvas.addEventListener('touchend',    onTouchEnd);
+canvas.addEventListener('touchcancel', onTouchEnd);
+
+function updateJoy(tx, ty) {
+  let dx = tx - joy.cx, dy = ty - joy.cy;
+  const d = Math.hypot(dx, dy);
+  if (d > joy.r) { dx = dx / d * joy.r; dy = dy / d * joy.r; }
+  joy.dx = dx; joy.dy = dy;
+}
+
+// 滑鼠 fallback（桌面測試）
+canvas.addEventListener('click', e => {
+  if (!gameOver) return;
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (mx >= restartBtn.x && mx <= restartBtn.x + restartBtn.w &&
+      my >= restartBtn.y && my <= restartBtn.y + restartBtn.h) restartGame();
+});
+// 鍵盤重新開始
+window.addEventListener('keydown', e => {
+  if (gameOver && (e.code === 'Enter' || e.code === 'Space')) restartGame();
+});
+
+// ==================== 海底物件定義 ====================
+const ITEM_DEFS = [
+  { emoji:'🐟', type:'fish',     pts: 100, food: 8,  spd:[1,2.5],  sz:32, wt:5 },
+  { emoji:'🐠', type:'fish',     pts: 120, food: 10, spd:[1,2],    sz:32, wt:4 },
+  { emoji:'🦑', type:'special',  pts: 300, food: 15, spd:[2,3.5],  sz:34, wt:2, wave:true },
+  { emoji:'🐙', type:'special',  pts: 350, food: 18, spd:[1.8,3],  sz:36, wt:1, wave:true },
+  { emoji:'🐡', type:'obstacle', pts:-150, food:-20, spd:[0.8,1.8],sz:30, wt:2 },
+  { emoji:'🥾', type:'obstacle', pts:-100, food:-15, spd:[0.5,1.2],sz:32, wt:2 },
+  { emoji:'🥫', type:'obstacle', pts: -80, food:-10, spd:[0.6,1.5],sz:28, wt:2 },
+];
+
+function pickItemDef() {
+  const total = ITEM_DEFS.reduce((s, d) => s + d.wt, 0);
+  let r = Math.random() * total;
+  for (const d of ITEM_DEFS) { r -= d.wt; if (r <= 0) return d; }
+  return ITEM_DEFS[0];
+}
+
+// ==================== 動態物件陣列 ====================
+let items    = [];   // 海底物件
+let particles = [];  // 粒子特效
+let floats    = [];  // 浮動文字（+100 等）
+let bubbles   = [];  // 背景氣泡
+
+// ==================== 生成海底物件 ====================
+function spawnItem() {
+  const d = pickItemDef();
+  const left = Math.random() < 0.5;
+  const spd = (d.spd[0] + Math.random() * (d.spd[1] - d.spd[0])) * S;
+  const minY = SEA_Y + 35 * S;
+  const maxY = GAME_H - 30 * S;
+  const y = minY + Math.random() * (maxY - minY);
+  const sz = d.sz * S;
+  items.push({
+    emoji: d.emoji, type: d.type, pts: d.pts, food: d.food,
+    wave: d.wave || false,
+    x: left ? -sz : W + sz,
+    y, baseY: y,
+    speed: left ? spd : -spd,
+    sz, phase: Math.random() * Math.PI * 2,
+  });
+}
+
+// ==================== 粒子 ====================
+function emitParticles(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 4 * S,
+      vy: (Math.random() - 1) * 3 * S,
+      life: 35 + Math.random() * 20,
+      max: 55, r: (2 + Math.random() * 3) * S, color,
+    });
+  }
+}
+
+// ==================== 浮動文字 ====================
+function addFloat(x, y, text, color) {
+  floats.push({ x, y, text, color, life: 55, max: 55 });
+}
+
+// ==================== 氣泡 ====================
+function spawnBubble() {
+  bubbles.push({
+    x: Math.random() * W, y: GAME_H + 5,
+    r: (1.5 + Math.random() * 3) * S,
+    spd: (0.3 + Math.random() * 0.6) * S,
+    alpha: 0.12 + Math.random() * 0.2,
+    drift: (Math.random() - 0.5) * 0.3 * S,
+  });
+}
+
+// ==================== 碰撞偵測 ====================
+function overlap(ax, ay, as, bx, by, bs) {
+  const hr = (as + bs) * 0.45;
+  return Math.abs(ax - bx) < hr && Math.abs(ay - by) < hr;
+}
+
+// ==================== 更新邏輯 ====================
+function update() {
+  if (gameOver) return;
+  frameCount++;
+
+  // 飢餓度下降
+  hunger -= HUNGER_DECAY;
+  if (hunger <= 0) { hunger = 0; gameOver = true; return; }
+
+  // 暈眩倒數
+  if (stunTimer > 0) stunTimer--;
+
+  // === 玩家移動 ===
+  if (stunTimer <= 0) {
+    // 搖桿輸入
+    if (joy.active) {
+      const nx = joy.dx / joy.r;
+      if (Math.abs(nx) > 0.08) player.x += nx * PLAYER_SPEED * S;
+    }
+    // 鍵盤輸入
+    if (keys['ArrowLeft']  || keys['KeyA']) player.x -= PLAYER_SPEED * S;
+    if (keys['ArrowRight'] || keys['KeyD']) player.x += PLAYER_SPEED * S;
+  }
+  player.x = Math.max(35 * S, Math.min(W - 35 * S, player.x));
+  player.bobY = Math.sin(frameCount * 0.04) * 3 * S;
+
+  // === 釣鉤：發射 ===
+  const wantCast = castRequested || keys['Space'] || keys['ArrowDown'];
+  castRequested = false;
+  if (wantCast && !hook.active && !hook.reeling && stunTimer <= 0) {
+    hook.active = true; hook.reeling = false;
+    hook.x = player.x; hook.y = player.y + 20 * S;
+    hook.caught = null;
+  }
+
+  // === 釣鉤：下沉 ===
+  if (hook.active && !hook.reeling) {
+    hook.y += HOOK_GRAVITY * S;
+    // 碰撞偵測
+    const hs = 14 * S;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (overlap(hook.x, hook.y, hs, it.x, it.y, it.sz)) {
+        hook.caught = it; hook.reeling = true;
+        items.splice(i, 1); break;
+      }
+    }
+    if (hook.y >= GAME_H - 8) hook.reeling = true;
+  }
+
+  // === 釣鉤：收回 ===
+  if (hook.reeling) {
+    hook.y -= HOOK_REEL * S;
+    if (hook.caught) { hook.caught.x = hook.x; hook.caught.y = hook.y + 14 * S; }
+    if (hook.y <= player.y + 8 * S) {
+      if (hook.caught) {
+        const it = hook.caught;
+        score = Math.max(0, score + it.pts);
+        if (it.type === 'obstacle') {
+          stunTimer = STUN_FRAMES;
+          screenFlash = 10;
+          hunger = Math.max(0, hunger + it.food);
+          emitParticles(player.x, player.y, '#ff4444', 14);
+          addFloat(player.x, player.y - 30 * S, `${it.pts}`, '#ff6666');
+          if (navigator.vibrate) navigator.vibrate([40, 20, 80]); // 觸覺回饋：障礙物
+        } else {
+          hunger = Math.min(HUNGER_MAX, hunger + it.food);
+          const c = it.type === 'special' ? '#ffdd44' : '#44ffaa';
+          emitParticles(player.x, player.y, c, 12);
+          addFloat(player.x, player.y - 30 * S, `+${it.pts}`, c);
+          if (navigator.vibrate) navigator.vibrate(30); // 觸覺回饋：釣到魚
+        }
+        hook.caught = null;
+      }
+      hook.active = false; hook.reeling = false;
+    }
+  }
+
+  // === 海底物件移動 ===
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.x += it.speed;
+    if (it.wave) { it.phase += 0.04; it.y = it.baseY + Math.sin(it.phase) * 22 * S; }
+    if ((it.speed > 0 && it.x > W + 60) || (it.speed < 0 && it.x < -60)) items.splice(i, 1);
+  }
+
+  // === 生成物件 ===
+  if (--spawnCD <= 0) {
+    spawnItem();
+    spawnCD = SPAWN_MIN + Math.floor(Math.random() * (SPAWN_MAX - SPAWN_MIN));
+    if (frameCount > 500) spawnCD = Math.max(18, spawnCD - 12);
+  }
+
+  // === 粒子 ===
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.05 * S;
+    if (--p.life <= 0) particles.splice(i, 1);
+  }
+  // === 浮動文字 ===
+  for (let i = floats.length - 1; i >= 0; i--) {
+    floats[i].y -= 0.8 * S;
+    if (--floats[i].life <= 0) floats.splice(i, 1);
+  }
+  // === 氣泡 ===
+  if (frameCount % 10 === 0) spawnBubble();
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y -= b.spd; b.x += b.drift;
+    if (b.y < SEA_Y - 10) bubbles.splice(i, 1);
+  }
+  // 畫面閃爍衰減
+  if (screenFlash > 0) screenFlash--;
+}
+
+// ==================== 繪製 ====================
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  drawSky();
+  drawSea();
+  drawLightRays();
+  drawBubbles();
+  drawSeaweed();
+  drawItems();
+  drawHookLine();
+  drawWaves();
+  drawPlayer();
+  drawParticles();
+  drawFloats();
+  drawHUD();
+  drawScreenFlash();
+  drawControlZone();
+  if (gameOver) drawGameOver();
+}
+
+// ---------- 天空 ----------
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, SEA_Y);
+  g.addColorStop(0, '#0a0e27'); g.addColorStop(1, '#1a2550');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, SEA_Y);
+  // 星星
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  const seeds = [22,78,155,230,310,400,475,555,640,710,760];
+  for (const sx of seeds) {
+    const px = sx / 800 * W;
+    const py = (8 + (sx * 7) % 60) / 800 * W;
+    if (py > SEA_Y - 4) continue;
+    const twinkle = 0.4 + 0.6 * Math.abs(Math.sin(frameCount * 0.02 + sx));
+    ctx.globalAlpha = twinkle * 0.6;
+    ctx.beginPath(); ctx.arc(px, py, (1 + (sx % 3) * 0.5) * S, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // 月亮
+  const mx = W * 0.82, my = SEA_Y * 0.35, mr = 16 * S;
+  ctx.fillStyle = '#fffde7';
+  ctx.beginPath(); ctx.arc(mx, my, mr, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#0a0e27';
+  ctx.beginPath(); ctx.arc(mx + mr * 0.45, my - mr * 0.25, mr * 0.8, 0, Math.PI * 2); ctx.fill();
+}
+
+// ---------- 海水 ----------
+function drawSea() {
+  const g = ctx.createLinearGradient(0, SEA_Y, 0, GAME_H);
+  g.addColorStop(0,   '#1565C0');
+  g.addColorStop(0.25,'#0D47A1');
+  g.addColorStop(0.6, '#0a2e6e');
+  g.addColorStop(1,   '#04122e');
+  ctx.fillStyle = g; ctx.fillRect(0, SEA_Y, W, GAME_H - SEA_Y);
+}
+
+// ---------- 海底光線 ----------
+function drawLightRays() {
+  ctx.save();
+  for (let i = 0; i < 5; i++) {
+    const bx = W * (0.08 + i * 0.22);
+    const sway = Math.sin(frameCount * 0.007 + i * 1.3) * 18 * S;
+    const tw = 4 * S, bw = (25 + i * 8) * S;
+    const depth = (GAME_H - SEA_Y) * 0.55;
+    const g = ctx.createLinearGradient(bx, SEA_Y, bx, SEA_Y + depth);
+    g.addColorStop(0, 'rgba(80,160,255,0.035)');
+    g.addColorStop(1, 'rgba(80,160,255,0)');
+    ctx.beginPath();
+    ctx.moveTo(bx - tw + sway, SEA_Y);
+    ctx.lineTo(bx + tw + sway, SEA_Y);
+    ctx.lineTo(bx + sway * 0.4 + bw, SEA_Y + depth);
+    ctx.lineTo(bx + sway * 0.4 - bw, SEA_Y + depth);
+    ctx.closePath();
+    ctx.fillStyle = g; ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---------- 氣泡 ----------
+function drawBubbles() {
+  for (const b of bubbles) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(140,200,255,${b.alpha})`;
+    ctx.lineWidth = 0.8 * S; ctx.stroke();
+  }
+}
+
+// ---------- 海草 ----------
+function drawSeaweed() {
+  const gY = GAME_H - 3;
+  ctx.lineCap = 'round';
+  for (let x = 25; x < W; x += 55 + (x * 3 % 30)) {
+    const h = (18 + (x * 7 % 25)) * S;
+    const sw = Math.sin(frameCount * 0.015 + x * 0.08) * 6 * S;
+    ctx.beginPath(); ctx.moveTo(x, gY);
+    ctx.quadraticCurveTo(x + sw, gY - h * 0.55, x + sw * 1.3, gY - h);
+    ctx.strokeStyle = `rgba(30,110,55,${0.12 + (x * 11 % 8) * 0.01})`;
+    ctx.lineWidth = (1.5 + (x % 3)) * S; ctx.stroke();
+  }
+}
+
+// ---------- 海底物件 ----------
+function drawItems() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const it of items) {
+    ctx.save();
+    if (it.speed < 0) {
+      ctx.translate(it.x, it.y); ctx.scale(-1, 1);
+      ctx.font = `${it.sz}px serif`; ctx.fillText(it.emoji, 0, 0);
+    } else {
+      ctx.font = `${it.sz}px serif`; ctx.fillText(it.emoji, it.x, it.y);
+    }
+    ctx.restore();
+  }
+}
+
+// ---------- 釣線 & 釣鉤 ----------
+function drawHookLine() {
+  if (!hook.active) return;
+  const py = player.y + player.bobY;
+  // 釣線
+  ctx.beginPath();
+  ctx.moveTo(player.x, py + 14 * S);
+  ctx.lineTo(hook.x, hook.y);
+  ctx.strokeStyle = 'rgba(210,210,220,0.7)';
+  ctx.lineWidth = 1.2 * S; ctx.stroke();
+  // 釣鉤（Canvas 繪製）
+  const hs = 8 * S;
+  ctx.save(); ctx.translate(hook.x, hook.y);
+  ctx.strokeStyle = '#ccd'; ctx.lineWidth = 2 * S; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -hs); ctx.lineTo(0, hs * 0.3);
+  ctx.arc(hs * 0.35, hs * 0.3, hs * 0.35, Math.PI, -0.2, true);
+  ctx.stroke();
+  ctx.restore();
+  // 被鉤住的物件
+  if (hook.caught) {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = `${hook.caught.sz}px serif`;
+    ctx.fillText(hook.caught.emoji, hook.caught.x, hook.caught.y);
+  }
+}
+
+// ---------- 海浪（半透明，疊在物件上方） ----------
+function drawWaves() {
+  for (let w = 0; w < 3; w++) {
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += 3) {
+      const y = SEA_Y + w * 2 * S + Math.sin((x / S + frameCount * 1.2 + w * 50) * 0.022) * 3.5 * S;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = `rgba(100,180,255,${0.25 - w * 0.06})`;
+    ctx.lineWidth = (1.8 - w * 0.3) * S; ctx.stroke();
+  }
+}
+
+// ---------- 玩家（貓咪 + 鍋子） ----------
+function drawPlayer() {
+  const py = player.y + player.bobY;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // 暈眩閃爍
+  if (stunTimer > 0 && Math.floor(frameCount / 4) % 2 === 0) ctx.globalAlpha = 0.35;
+  // 鍋子
+  ctx.font = `${36 * S}px serif`;
+  ctx.fillText('🍲', player.x, py + 10 * S);
+  // 貓咪
+  ctx.font = `${28 * S}px serif`;
+  ctx.fillText('🐱', player.x, py - 12 * S);
+  ctx.globalAlpha = 1;
+  // 暈眩星星
+  if (stunTimer > 0) {
+    ctx.font = `${14 * S}px serif`;
+    const a = frameCount * 0.12;
+    ctx.fillText('💫', player.x + Math.cos(a) * 18 * S, py - 28 * S + Math.sin(a) * 6 * S);
+    ctx.fillText('⭐', player.x + Math.cos(a + 2.2) * 20 * S, py - 26 * S + Math.sin(a + 2.2) * 6 * S);
+  }
+}
+
+// ---------- 粒子 ----------
+function drawParticles() {
+  for (const p of particles) {
+    const a = p.life / p.max;
+    ctx.globalAlpha = a;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * a, 0, Math.PI * 2);
+    ctx.fillStyle = p.color; ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- 浮動文字 ----------
+function drawFloats() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of floats) {
+    const a = f.life / f.max;
+    ctx.globalAlpha = a;
+    ctx.font = `bold ${16 * S}px system-ui,sans-serif`;
+    ctx.fillStyle = f.color;
+    // 陰影增加可讀性
+    ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 4 * S;
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.shadowBlur = 0;
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- HUD ----------
+function drawHUD() {
+  const pad = 10 * S;
+  // --- 分數 ---
+  ctx.fillStyle = 'rgba(5,10,30,0.55)';
+  rr(ctx, pad, pad, 130 * S, 30 * S, 8 * S); ctx.fill();
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${15 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = '#FFD700';
+  ctx.fillText(`🎣 ${score}`, pad + 8 * S, pad + 15 * S);
+
+  // --- 飢餓度條 ---
+  const bw = Math.min(200 * S, W * 0.4), bh = 14 * S;
+  const bx = (W - bw) / 2, by = pad + 3 * S;
+  // 外框
+  ctx.fillStyle = 'rgba(5,10,30,0.55)';
+  rr(ctx, bx - 4 * S, by - 4 * S, bw + 8 * S, bh + 8 * S, 6 * S); ctx.fill();
+  // 背景
+  ctx.fillStyle = '#1a1a2e';
+  rr(ctx, bx, by, bw, bh, 4 * S); ctx.fill();
+  // 填充
+  const ratio = hunger / HUNGER_MAX;
+  const bc = ratio > 0.5 ? '#4CAF50' : ratio > 0.25 ? '#FF9800' : '#F44336';
+  if (ratio > 0) { rr(ctx, bx, by, bw * ratio, bh, 4 * S); ctx.fillStyle = bc; ctx.fill(); }
+  // 標籤
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${10 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`${Math.ceil(hunger)}%`, bx + bw / 2, by + bh / 2);
+
+  // 暈眩提示
+  if (stunTimer > 0) {
+    ctx.font = `bold ${14 * S}px system-ui,sans-serif`;
+    ctx.fillStyle = '#ff6666';
+    ctx.fillText('💫 暈眩中...', W / 2, pad + 38 * S);
+  }
+}
+
+// ---------- 受擊閃爍 ----------
+function drawScreenFlash() {
+  if (screenFlash > 0) {
+    ctx.fillStyle = `rgba(255,30,30,${screenFlash / 10 * 0.15})`;
+    ctx.fillRect(0, 0, W, GAME_H);
+  }
+}
+
+// ---------- 控制區 ----------
+function drawControlZone() {
+  // 漸層背景
+  const g = ctx.createLinearGradient(0, H - CTRL_H - 25, 0, H);
+  g.addColorStop(0,    'rgba(5,10,25,0)');
+  g.addColorStop(0.12, 'rgba(5,10,25,0.65)');
+  g.addColorStop(1,    'rgba(5,10,25,0.92)');
+  ctx.fillStyle = g; ctx.fillRect(0, H - CTRL_H - 25, W, CTRL_H + 25);
+  // 分隔線
+  ctx.strokeStyle = 'rgba(80,130,220,0.08)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(20, H - CTRL_H); ctx.lineTo(W - 20, H - CTRL_H); ctx.stroke();
+
+  drawJoystick();
+  drawCastButton();
+}
+
+// ---------- 虛擬搖桿繪製 ----------
+function drawJoystick() {
+  const { cx, cy, r, kr, dx, dy, active } = joy;
+  // 外環
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.035)'; ctx.fill();
+  ctx.strokeStyle = active ? 'rgba(124,58,237,0.45)' : 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 1.5; ctx.stroke();
+  // 方向指示點
+  for (const [ddx, ddy] of [[0,-1],[0,1],[-1,0],[1,0]]) {
+    ctx.beginPath(); ctx.arc(cx + ddx * (r - 6), cy + ddy * (r - 6), 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fill();
+  }
+  // 把手
+  const kx = cx + dx, ky = cy + dy;
+  ctx.beginPath(); ctx.arc(kx, ky, kr, 0, Math.PI * 2);
+  const kg = ctx.createRadialGradient(kx - 2, ky - 2, 0, kx, ky, kr);
+  if (active) {
+    kg.addColorStop(0, 'rgba(167,139,250,0.9)');
+    kg.addColorStop(1, 'rgba(124,58,237,0.55)');
+  } else {
+    kg.addColorStop(0, 'rgba(180,180,210,0.35)');
+    kg.addColorStop(1, 'rgba(130,130,165,0.15)');
+  }
+  ctx.fillStyle = kg; ctx.fill();
+  // 把手光暈
+  if (active) {
+    ctx.shadowColor = 'rgba(124,58,237,0.4)'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(kx, ky, kr, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(167,139,250,0.4)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  // 標籤
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${9 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fillText('移動', cx, Math.min(cy + r + 12, H - 8));
+}
+
+// ---------- 釣魚按鈕繪製 ----------
+function drawCastButton() {
+  const { cx, cy, r, pressed } = cast;
+  const ready = !hook.active && !hook.reeling && stunTimer <= 0 && !gameOver;
+  // 脈動光暈
+  if (ready) {
+    const pulse = Math.sin(frameCount * 0.07) * 0.12 + 0.14;
+    ctx.beginPath(); ctx.arc(cx, cy, r + 8 + Math.sin(frameCount * 0.07) * 3, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(244,63,94,${pulse})`; ctx.fill();
+  }
+  // 按鈕本體
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  const bg = ctx.createRadialGradient(cx - 4, cy - 4, 0, cx, cy, r);
+  if (!ready) {
+    bg.addColorStop(0, 'rgba(70,70,90,0.45)');
+    bg.addColorStop(1, 'rgba(40,40,60,0.35)');
+  } else if (pressed) {
+    bg.addColorStop(0, 'rgba(255,110,130,0.95)');
+    bg.addColorStop(1, 'rgba(210,35,65,0.85)');
+  } else {
+    bg.addColorStop(0, 'rgba(244,75,105,0.88)');
+    bg.addColorStop(1, 'rgba(195,28,58,0.72)');
+  }
+  ctx.fillStyle = bg; ctx.fill();
+  // 鉤子圖示
+  const ic = ready ? '#fff' : '#666', is = r * 0.42;
+  ctx.save(); ctx.translate(cx, cy - 1);
+  ctx.strokeStyle = ic; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -is); ctx.lineTo(0, is * 0.15);
+  ctx.arc(is * 0.3, is * 0.15, is * 0.3, Math.PI, -0.2, true);
+  ctx.stroke();
+  ctx.restore();
+  // 標籤
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${10 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = ready ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.2)';
+  ctx.fillText('釣!', cx, Math.min(cy + r + 12, H - 8));
+}
+
+// ---------- 圓角矩形 ----------
+function rr(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.lineTo(x + w - r, y); c.quadraticCurveTo(x + w, y, x + w, y + r);
+  c.lineTo(x + w, y + h - r); c.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  c.lineTo(x + r, y + h); c.quadraticCurveTo(x, y + h, x, y + h - r);
+  c.lineTo(x, y + r); c.quadraticCurveTo(x, y, x + r, y);
+  c.closePath();
+}
+
+// ---------- Game Over ----------
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+  const pw = Math.min(320 * S, W * 0.85), ph = 210 * S;
+  const px = (W - pw) / 2, py = (GAME_H - ph) / 2;
+  // 面板
+  ctx.fillStyle = 'rgba(10,18,45,0.94)';
+  rr(ctx, px, py, pw, ph, 14 * S); ctx.fill();
+  ctx.strokeStyle = 'rgba(80,120,200,0.3)'; ctx.lineWidth = 1.5;
+  rr(ctx, px, py, pw, ph, 14 * S); ctx.stroke();
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // 貓咪
+  ctx.font = `${40 * S}px serif`;
+  ctx.fillText('😿', W / 2, py + 42 * S);
+  // 標題
+  ctx.font = `bold ${28 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = '#FF6B6B';
+  ctx.fillText('Game Over', W / 2, py + 85 * S);
+  // 分數
+  ctx.font = `${18 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = '#FFD700';
+  ctx.fillText(`最終分數: ${score}`, W / 2, py + 118 * S);
+  // 重新開始按鈕
+  const bw = 170 * S, bh = 42 * S;
+  const bx = (W - bw) / 2, by = py + 148 * S;
+  ctx.fillStyle = '#4CAF50';
+  rr(ctx, bx, by, bw, bh, 10 * S); ctx.fill();
+  ctx.font = `bold ${16 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = '#fff';
+  ctx.fillText('🔄 重新開始', W / 2, by + bh / 2);
+  restartBtn.x = bx; restartBtn.y = by; restartBtn.w = bw; restartBtn.h = bh;
+}
+
+// ==================== 重新開始 ====================
+function restartGame() {
+  score = 0; hunger = HUNGER_MAX; gameOver = false;
+  stunTimer = 0; frameCount = 0; spawnCD = 50; screenFlash = 0;
+  castRequested = false;
+  items = []; particles = []; floats = []; bubbles = [];
+  hook.active = false; hook.reeling = false; hook.caught = null;
+  player.x = W / 2;
+  recalcLayout();
+  for (let i = 0; i < 4; i++) spawnItem();
+}
+
+// ==================== Playwright 測試掛鉤 ====================
+// render_game_to_text: 回傳 JSON 遊戲狀態
+// 座標系：原點左上角，X 向右、Y 向下
+window.render_game_to_text = () => JSON.stringify({
+  mode: gameOver ? 'gameover' : stunTimer > 0 ? 'stunned' : 'playing',
+  score,
+  hunger: Math.round(hunger * 10) / 10,
+  player: { x: Math.round(player.x), y: Math.round(player.y) },
+  hook: {
+    active: hook.active, reeling: hook.reeling,
+    x: Math.round(hook.x), y: Math.round(hook.y),
+    caught: hook.caught ? { type: hook.caught.type, emoji: hook.caught.emoji } : null,
+  },
+  entities: items.map(it => ({
+    type: it.type, emoji: it.emoji,
+    x: Math.round(it.x), y: Math.round(it.y),
+  })),
+  stunTimer, frameCount,
+  canvas: { w: W, h: H, seaY: Math.round(SEA_Y), ctrlH: Math.round(CTRL_H) },
+});
+
+// advanceTime: 確定性時間推進（供 Playwright 腳本呼叫）
+window.advanceTime = (ms) => {
+  const steps = Math.max(1, Math.round(ms / (1000 / 60)));
+  for (let i = 0; i < steps; i++) update();
+  draw();
+};
+
+// ==================== 主迴圈 ====================
+function gameLoop() {
+  update();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+// ==================== 初始化 ====================
+resize();
+player.x = W / 2;
+recalcLayout();
+for (let i = 0; i < 5; i++) spawnItem();
+gameLoop();
+</script>
+</body>
+</html>
