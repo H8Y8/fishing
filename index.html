@@ -79,8 +79,8 @@ window.addEventListener('resize', resize);
 
 // ==================== 遊戲常數 ====================
 const PLAYER_SPEED = 3.5;
-const HOOK_GRAVITY = 2.6;
-const HOOK_REEL    = 4.8;
+const HOOK_GRAVITY = 4.0;
+const HOOK_REEL    = 6.5;
 const HUNGER_MAX   = 100;
 const HUNGER_DECAY = 0.028;
 const STUN_FRAMES  = 90;          // ≈ 1.5 秒
@@ -719,6 +719,16 @@ function update() {
   // === 釣鉤：收回 ===
   if (hook.reeling) {
     hook.y -= HOOK_REEL * S;
+    // 上行途中也能勾到東西
+    if (!hook.caught) {
+      const hs = 14 * S;
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (overlap(hook.x, hook.y, hs, it.x, it.y, it.sz)) {
+          hook.caught = it; items.splice(i, 1); break;
+        }
+      }
+    }
     if (hook.caught) { hook.caught.x = hook.x; hook.caught.y = hook.y + 14 * S; }
     if (hook.y <= player.y + 8 * S) {
       if (hook.caught) {
