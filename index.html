@@ -692,13 +692,19 @@ function update() {
   player.x = Math.max(35 * S, Math.min(W - 35 * S, player.x));
   player.bobY = Math.sin(frameCount * 0.04) * 3 * S;
 
-  // === 釣鉤：發射 ===
+  // === 釣鉤：發射 / 提早收鉤 ===
   const wantCast = castRequested || keys['Space'] || keys['ArrowDown'];
   castRequested = false;
-  if (wantCast && !hook.active && !hook.reeling && stunTimer <= 0) {
-    hook.active = true; hook.reeling = false;
-    hook.x = player.x; hook.y = player.y + 20 * S;
-    hook.caught = null;
+  if (wantCast && stunTimer <= 0) {
+    if (!hook.active && !hook.reeling) {
+      // 發射
+      hook.active = true; hook.reeling = false;
+      hook.x = player.x; hook.y = player.y + 20 * S;
+      hook.caught = null;
+    } else if (hook.active && !hook.reeling) {
+      // 提早收鉤
+      hook.reeling = true;
+    }
   }
 
   // === 釣鉤：下沉 ===
