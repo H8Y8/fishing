@@ -86,6 +86,7 @@ const HUNGER_DECAY = 0.028;
 const STUN_FRAMES  = 90;          // ≈ 1.5 秒
 const SPAWN_MIN    = 40;
 const SPAWN_MAX    = 85;
+const GAME_TIME    = 60;            // 一場 60 秒
 
 // ==================== 遊戲狀態 ====================
 let score       = 0;
@@ -96,6 +97,7 @@ let frameCount  = 0;
 let spawnCD     = 50;
 let screenFlash = 0;               // 受擊畫面閃爍
 let castRequested = false;          // 觸控釣魚請求
+let timeLeft    = GAME_TIME;        // 剩餘秒數
 
 // ==================== 玩家 ====================
 const player = { x: 0, y: 0, bobY: 0 };
@@ -671,6 +673,10 @@ function update() {
   if (gameOver) return;
   frameCount++;
 
+  // 倒數計時（每 60 幀 = 1 秒）
+  if (frameCount % 60 === 0) timeLeft--;
+  if (timeLeft <= 0) { timeLeft = 0; gameOver = true; return; }
+
   // 飢餓度下降
   hunger -= HUNGER_DECAY;
   if (hunger <= 0) { hunger = 0; gameOver = true; return; }
@@ -1012,6 +1018,18 @@ function drawHUD() {
   ctx.fillStyle = '#FFD700';
   ctx.fillText(`${score}`, pad + 32 * S, pad + 15 * S);
 
+  // --- 倒數計時（右上角）---
+  const tw = 70 * S;
+  ctx.fillStyle = 'rgba(5,10,30,0.55)';
+  rr(ctx, W - pad - tw, pad, tw, 30 * S, 8 * S); ctx.fill();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${15 * S}px system-ui,sans-serif`;
+  ctx.fillStyle = timeLeft <= 10 ? '#F44336' : '#fff';
+  // 低於 10 秒閃爍
+  if (timeLeft <= 10 && Math.floor(frameCount / 15) % 2 === 0) ctx.globalAlpha = 0.4;
+  ctx.fillText(`${timeLeft}s`, W - pad - tw / 2, pad + 15 * S);
+  ctx.globalAlpha = 1;
+
   // --- 飢餓度條 ---
   const bw = Math.min(200 * S, W * 0.4), bh = 14 * S;
   const bx = (W - bw) / 2, by = pad + 3 * S;
@@ -1172,7 +1190,7 @@ function drawGameOver() {
   // 標題
   ctx.font = `bold ${28 * S}px system-ui,sans-serif`;
   ctx.fillStyle = '#FF6B6B';
-  ctx.fillText('Game Over', W / 2, py + 85 * S);
+  ctx.fillText(timeLeft <= 0 ? '時間到！' : 'Game Over', W / 2, py + 85 * S);
   // 分數
   ctx.font = `${18 * S}px system-ui,sans-serif`;
   ctx.fillStyle = '#FFD700';
@@ -1194,7 +1212,7 @@ function drawGameOver() {
 function restartGame() {
   score = 0; hunger = HUNGER_MAX; gameOver = false;
   stunTimer = 0; frameCount = 0; spawnCD = 50; screenFlash = 0;
-  castRequested = false;
+  castRequested = false; timeLeft = GAME_TIME;
   items = []; particles = []; floats = []; bubbles = [];
   hook.active = false; hook.reeling = false; hook.caught = null;
   player.x = W / 2;
